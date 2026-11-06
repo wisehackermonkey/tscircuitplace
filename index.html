@@ -1,9 +1,230 @@
-<!DOCTYPE html>
+<!doctype html>
 <html>
 <head>
-  <title>tscircuitplace</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>PCB Placement Viewer</title>
+<style>
+:root{color-scheme:light dark;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+body{font:13px system-ui,sans-serif;margin:8px}
+textarea{width:100%;height:110px;font:12px monospace;box-sizing:border-box}
+svg{width:100%;height:60vh;border:1px solid;touch-action:none}
+rect{cursor:move}
+.row{display:grid;grid-template-columns:110px 1fr 64px 1fr 64px;gap:4px;align-items:center}
+.row.sel{background:rgba(128,128,255,.3)}
+.row span{cursor:pointer;overflow:hidden;text-overflow:ellipsis}
+input[type=number]{width:64px}
+#list{max-height:40vh;overflow:auto;margin:6px 0}
+</style>
 </head>
 <body>
-  <h1>tscircuitplace</h1>
+<b>1. Paste tscircuit code</b>
+<textarea id="src" spellcheck="false"><board width="100mm" height="60mm">
+  <resistor name="R1" resistance="1k" footprint="0402" pcbX={-20} pcbY={10} />
+  <capacitor name="C1" capacitance="1uF" footprint="0805" pcbX={0} pcbY={-10} layer="bottom" />
+  <chip name="U1" footprint="soic8" pcbX={25} pcbY={5} pcbRotation={90} />
+</board></textarea>
+
+<p>
+<b>Board</b>
+width <input id="bw" type="number" step="0.1"> mm &nbsp;
+height <input id="bh" type="number" step="0.1"> mm &nbsp;
+snap <input id="snap" type="number" min="0" step="0.1" value="0" style="width:50px"> mm &nbsp;
+<label><input id="lbl" type="checkbox" checked> labels</label>
+<button id="fit">fit view</button>
+<span id="info"></span>
+</p>
+
+<svg id="pcb"></svg>
+
+<b>2. Drag boxes or use sliders</b>
+<div id="list"></div>
+
+<b>3. Updated code</b> <button id="copy">copy</button>
+<textarea id="out" readonly spellcheck="false"></textarea>
+
+<script>
+const $=s=>document.querySelector(s), NS='http://www.w3.org/2000/svg';
+const svg=$('#pcb'), list=$('#list');
+const FP={'0402':[1.6,.8],'0603':[2,1],'0805':[2.4,1.4],'1206':[3.6,1.8],'1210':[3.6,2.8],'sot23_6':[3,3]};
+let src='', board, items=[], sel=-1, B={}, fs=2;
+const r2=v=>Math.round(v*100)/100;
+const el=(n,a={})=>{const e=document.createElementNS(NS,n);for(const k in a)e.setAttribute(k,a[k]);return e};
+
+// ---------- parsing ----------
+function getEnv(t){
+  const env={}, re=/^(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*(?::[^=\n]+)?=\s*(.+?);?[ \t]*$/gm; let m;
+  while((m=re.exec(t))){
+    try{const k=Object.keys(env);
+      env[m[1]]=new Function(...k,'return ('+m[2].replace(/\s\/\/.*$/,'')+')')(...k.map(x=>env[x]));}catch(e){}
+  }
+  return env;
+}
+function ev(expr,env){
+  try{const k=Object.keys(env);return new Function(...k,'return ('+expr+')')(...k.map(x=>env[x]));}catch(e){return null}
+}
+function tagEnd(t,i){
+  let d=0,q=null;
+  for(;i<t.length;i++){const c=t[i];
+    if(q){if(c===q&&t[i-1]!=='\\')q=null;continue}
+    if(c==='"'||c==="'"||c==='`'){q=c;continue}
+    if(c==='{')d++;else if(c==='}')d--;else if(c==='>'&&d<=0)return i;
+  }
+  return t.length;
+}
+function attr(tag,base,name){
+  const m=new RegExp('(?<![\\w-])'+name+'\\s*=\\s*').exec(tag); if(!m)return null;
+  const i=m.index+m[0].length, c=tag[i]; let j=i, expr;
+  if(c==='{'){let d=0;for(;j<tag.length;j++){if(tag[j]==='{')d++;else if(tag[j]==='}'&&--d===0){j++;break}} expr=tag.slice(i+1,j-1);}
+  else if(c==='"'||c==="'"){j=tag.indexOf(c,i+1)+1; expr=JSON.stringify(tag.slice(i+1,j-1));}
+  else return null;
+  return {expr,as:base+m.index,vs:base+i,ve:base+j};
+}
+function parse(){
+  src=$('#src').value; const env=getEnv(src);
+  board={w:100,h:100,ow:100,oh:100,wa:null,ha:null}; items=[]; sel=-1;
+  const re=/<([A-Za-z][\w.]*)/g; let m;
+  while((m=re.exec(src))){
+    const s=m.index, prev=src.slice(0,s).trimEnd().slice(-1);
+    if(/[\w)\]]/.test(prev))continue;
+    const e=tagEnd(src,s+1), tag=src.slice(s,e+1); re.lastIndex=e+1;
+    const name=m[1];
+    if(name==='board'){
+      const w=attr(tag,s,'width'),h=attr(tag,s,'height');
+      if(w){board.wa=w;board.w=board.ow=parseFloat(ev(w.expr,env))||100}
+      if(h){board.ha=h;board.h=board.oh=parseFloat(ev(h.expr,env))||100}
+      continue;
+    }
+    const xa=attr(tag,s,'pcbX'), ya=attr(tag,s,'pcbY');
+    if(!xa&&!ya)continue;
+    const na=attr(tag,s,'name'), fa=attr(tag,s,'footprint'), la=attr(tag,s,'layer'), ra=attr(tag,s,'pcbRotation');
+    const label=(na&&ev(na.expr,env))||name;
+    const fp=fa?ev(fa.expr,env):null, rot=ra?(parseFloat(ev(ra.expr,env))||0):0;
+    let [w,h]=/KeyMatrix/i.test(name)?[280,110]:(FP[fp]||[8,8]);
+    if(Math.abs(rot)%180===90)[w,h]=[h,w];
+    const x=parseFloat(xa&&ev(xa.expr,env))||0, y=parseFloat(ya&&ev(ya.expr,env))||0;
+    items.push({name:String(label),tag:name,x,y,ox:x,oy:y,xa,ya,ins:s+1+name.length,w,h,bottom:la&&ev(la.expr,env)==='bottom'});
+  }
+  $('#bw').value=board.w;$('#bh').value=board.h;
+  $('#info').textContent=' '+items.length+' items found';
+  render(); out();
+}
+
+// ---------- rendering ----------
+function bounds(){
+  let x0=-board.w/2,x1=board.w/2,y0=-board.h/2,y1=board.h/2;
+  items.forEach(i=>{x0=Math.min(x0,i.x-i.w/2);x1=Math.max(x1,i.x+i.w/2);y0=Math.min(y0,i.y-i.h/2);y1=Math.max(y1,i.y+i.h/2)});
+  const mg=Math.max(x1-x0,y1-y0)*.05; B={x0:x0-mg,x1:x1+mg,y0:y0-mg,y1:y1+mg};
+}
+function fit(){
+  bounds(); const w=B.x1-B.x0,h=B.y1-B.y0;
+  svg.setAttribute('viewBox',`${B.x0} ${-B.y1} ${w} ${h}`);
+  fs=Math.max(w,h)/90;
+  items.forEach(it=>{
+    it.sx.min=it.sy.min=0;
+    it.sx.min=B.x0;it.sx.max=B.x1;it.sy.min=B.y0;it.sy.max=B.y1;
+    it.t.setAttribute('font-size',fs);
+    place(it);
+  });
+  drawBoard();
+}
+function drawBoard(){
+  if(!svg.bd)return;
+  svg.bd.setAttribute('x',-board.w/2);svg.bd.setAttribute('y',-board.h/2);
+  svg.bd.setAttribute('width',board.w);svg.bd.setAttribute('height',board.h);
+}
+function place(it){
+  const mn=(B.x1-B.x0)/110, w=Math.max(it.w,mn), h=Math.max(it.h,mn);
+  it.r.setAttribute('x',it.x-w/2);it.r.setAttribute('y',-it.y-h/2);
+  it.r.setAttribute('width',w);it.r.setAttribute('height',h);
+  it.t.setAttribute('x',it.x);it.t.setAttribute('y',-it.y-h/2-fs*.3);
+  it.tt.textContent=`${it.name} (${it.x}, ${it.y})`;
+}
+function render(){
+  svg.innerHTML=''; list.innerHTML='';
+  svg.bd=el('rect',{fill:'rgba(0,150,60,.12)',stroke:'currentColor','vector-effect':'non-scaling-stroke','stroke-width':1.5,style:'cursor:default'});
+  svg.append(svg.bd);
+  bounds();
+  const order=items.map((_,i)=>i).sort((a,b)=>items[b].w*items[b].h-items[a].w*items[a].h);
+  order.forEach(i=>{
+    const it=items[i];
+    it.r=el('rect',{fill:it.bottom?'rgba(255,140,0,.35)':'rgba(60,120,255,.35)',stroke:it.bottom?'#f80':'#36f','stroke-width':1,'vector-effect':'non-scaling-stroke'});
+    it.tt=el('title');it.r.append(it.tt);
+    it.t=el('text',{'text-anchor':'middle',fill:'currentColor','pointer-events':'none'});
+    it.t.textContent=it.name;
+    it.r.addEventListener('pointerdown',e=>drag(e,i));
+    svg.append(it.r,it.t);
+  });
+  items.forEach((it,i)=>{
+    const row=document.createElement('div');row.className='row';
+    const nm=document.createElement('span');nm.textContent=it.name;nm.title=it.tag;nm.onclick=()=>select(i);
+    const mk=(k)=>{const s=document.createElement('input');s.type='range';s.step=.1;const n=document.createElement('input');n.type='number';n.step=.1;
+      s.oninput=()=>{n.value=s.value;setPos(i,k==='x'?+s.value:it.x,k==='y'?+s.value:it.y);select(i,true)};
+      n.oninput=()=>{if(n.value==='')return;s.value=n.value;setPos(i,k==='x'?+n.value:it.x,k==='y'?+n.value:it.y);select(i,true)};
+      return [s,n]};
+    const [sx,nx]=mk('x'),[sy,ny]=mk('y');
+    Object.assign(it,{row,sx,nx,sy,ny});
+    row.append(nm,sx,nx,sy,ny);list.append(row);
+  });
+  fit();
+  items.forEach(it=>{it.sx.value=it.nx.value=it.x;it.sy.value=it.ny.value=it.y});
+  setLabels();
+}
+function setLabels(){const on=$('#lbl').checked;items.forEach((it,i)=>it.t.style.display=on||i===sel?'':'none')}
+function select(i,keep){
+  sel=i;items.forEach((it,k)=>{it.row.classList.toggle('sel',k===i);it.r.setAttribute('stroke-width',k===i?3:1)});
+  if(!keep)items[i].row.scrollIntoView({block:'nearest'});
+  setLabels();
+}
+function setPos(i,x,y){
+  const it=items[i];it.x=r2(x);it.y=r2(y);
+  it.sx.value=it.nx.value=it.x;it.sy.value=it.ny.value=it.y;
+  place(it);out();
+}
+
+// ---------- dragging ----------
+function world(e){
+  const p=svg.createSVGPoint();p.x=e.clientX;p.y=e.clientY;
+  const q=p.matrixTransform(svg.getScreenCTM().inverse());return{x:q.x,y:-q.y};
+}
+function drag(e,i){
+  e.preventDefault();select(i);
+  const it=items[i],p=world(e),dx=p.x-it.x,dy=p.y-it.y;
+  it.r.setPointerCapture(e.pointerId);
+  const mv=ev=>{
+    const q=world(ev),sn=parseFloat($('#snap').value)||0;
+    let x=q.x-dx,y=q.y-dy;
+    if(sn){x=Math.round(x/sn)*sn;y=Math.round(y/sn)*sn}
+    setPos(i,x,y);
+  };
+  const up=()=>{it.r.removeEventListener('pointermove',mv);it.r.removeEventListener('pointerup',up)};
+  it.r.addEventListener('pointermove',mv);it.r.addEventListener('pointerup',up);
+}
+
+// ---------- output ----------
+function out(){
+  const ed=[];
+  if(board.wa&&board.w!==board.ow)ed.push({s:board.wa.as,e:board.wa.ve,t:`width="${board.w}mm"`});
+  if(board.ha&&board.h!==board.oh)ed.push({s:board.ha.as,e:board.ha.ve,t:`height="${board.h}mm"`});
+  items.forEach(it=>{
+    if(it.x!==it.ox)ed.push(it.xa?{s:it.xa.vs,e:it.xa.ve,t:`{${it.x}}`}:{s:it.ins,e:it.ins,t:` pcbX={${it.x}}`});
+    if(it.y!==it.oy)ed.push(it.ya?{s:it.ya.vs,e:it.ya.ve,t:`{${it.y}}`}:{s:it.ins,e:it.ins,t:` pcbY={${it.y}}`});
+  });
+  ed.sort((a,b)=>b.s-a.s);
+  let t=src;ed.forEach(d=>{t=t.slice(0,d.s)+d.t+t.slice(d.e)});
+  $('#out').value=t;
+}
+
+// ---------- events ----------
+$('#src').addEventListener('input',parse);
+$('#fit').onclick=fit;
+$('#lbl').onchange=setLabels;
+['bw','bh'].forEach(id=>$('#'+id).addEventListener('input',e=>{
+  const v=parseFloat(e.target.value);if(!(v>0))return;
+  board[id==='bw'?'w':'h']=v;drawBoard();out();
+}));
+$('#copy').onclick=()=>{const o=$('#out');o.select();try{document.execCommand('copy')}catch(e){}};
+parse();
+</script>
 </body>
 </html>
