@@ -1,0 +1,9 @@
+# Javascript specific
+.env
+.git/
+logs
+*.log
+npm-debug.log*
+node_modules
+*.sublime-workspace
+Desktop.ini
