@@ -14,11 +14,11 @@ rect{cursor:move}
 .row.sel{background:rgba(128,128,255,.3)}
 .row span{cursor:pointer;overflow:hidden;text-overflow:ellipsis}
 input[type=number]{width:64px}
-#list{max-height:40vh;overflow:auto;margin:6px 0}
+#list{max-height:40vh;overflow:auto;margin:6px 0;position:relative}
 </style>
 </head>
 <body>
-<b>1. Paste tscircuit code</b>
+<b>1. Paste tscircuit code</b> (pcbX / pcbY / width / height in this text update live as you move things) <button id="undo" title="Ctrl+Z">undo</button><button id="redo" title="Ctrl+Y / Ctrl+Shift+Z">redo</button> <button id="copy">copy code</button>
 <textarea id="src" spellcheck="false"><board width="100mm" height="60mm">
   <resistor name="R1" resistance="1k" footprint="0402" pcbX={-20} pcbY={10} />
   <capacitor name="C1" capacitance="1uF" footprint="0805" pcbX={0} pcbY={-10} layer="bottom" />
@@ -31,23 +31,34 @@ width <input id="bw" type="number" step="0.1"> mm &nbsp;
 height <input id="bh" type="number" step="0.1"> mm &nbsp;
 snap <input id="snap" type="number" min="0" step="0.1" value="0" style="width:50px"> mm &nbsp;
 <label><input id="lbl" type="checkbox" checked> labels</label>
-<button id="fit">fit view</button>
+zoom <button id="zin">+</button><button id="zout">-</button> <button id="fit">fit view</button>
+<button id="rst" title="restore the code as originally pasted">reset positions</button>
 <span id="info"></span>
 </p>
+
+<p id="align"><span id="cnt">0 selected</span> &nbsp; align (1 item = to board):
+<button data-a="l">left</button><button data-a="cx">center</button><button data-a="r">right</button>
+<button data-a="t">top</button><button data-a="cy">middle</button><button data-a="b">bottom</button>
+<button data-a="dh">distribute H</button><button data-a="dv">distribute V</button>
+<button data-a="all">select all</button><button data-a="none">none</button>
+<br><button data-a="grid">sort by name into grid</button>
+cols <input id="gcols" type="number" min="0" value="0" style="width:50px" title="0 = auto"> (0 = auto)
+gap <input id="ggap" type="number" min="0" step="0.1" value="1" style="width:50px"> mm
+<small>(uses the selection, or all items if none selected)</small>
+<br><small>shift/ctrl-click adds to selection, drag empty space to box-select, arrow keys nudge (shift = x10).</small></p>
 
 <svg id="pcb"></svg>
 
 <b>2. Drag boxes or use sliders</b>
 <div id="list"></div>
 
-<b>3. Updated code</b> <button id="copy">copy</button>
-<textarea id="out" readonly spellcheck="false"></textarea>
+
 
 <script>
 const $=s=>document.querySelector(s), NS='http://www.w3.org/2000/svg';
 const svg=$('#pcb'), list=$('#list');
 const FP={'0402':[1.6,.8],'0603':[2,1],'0805':[2.4,1.4],'1206':[3.6,1.8],'1210':[3.6,2.8],'sot23_6':[3,3]};
-let src='', board, items=[], sel=-1, B={}, fs=2;
+let src='', board, items=[], S=new Set(), B={}, fs=2, V={x:0,y:0,w:1,h:1}, FW=1, orig='';
 const r2=v=>Math.round(v*100)/100;
 const el=(n,a={})=>{const e=document.createElementNS(NS,n);for(const k in a)e.setAttribute(k,a[k]);return e};
 
@@ -80,9 +91,11 @@ function attr(tag,base,name){
   else return null;
   return {expr,as:base+m.index,vs:base+i,ve:base+j};
 }
+let RS=false; // true while re-indexing the text after a live sync
 function parse(){
   src=$('#src').value; const env=getEnv(src);
-  board={w:100,h:100,ow:100,oh:100,wa:null,ha:null}; items=[]; sel=-1;
+  const oldI=items,oldB=board,rs=RS;
+  board={w:100,h:100,ow:100,oh:100,wa:null,ha:null}; items=[]; if(!rs)S=new Set();
   const re=/<([A-Za-z][\w.]*)/g; let m;
   while((m=re.exec(src))){
     const s=m.index, prev=src.slice(0,s).trimEnd().slice(-1);
@@ -105,9 +118,20 @@ function parse(){
     const x=parseFloat(xa&&ev(xa.expr,env))||0, y=parseFloat(ya&&ev(ya.expr,env))||0;
     items.push({name:String(label),tag:name,x,y,ox:x,oy:y,xa,ya,ins:s+1+name.length,w,h,bottom:la&&ev(la.expr,env)==='bottom'});
   }
+  const cnt={};items.forEach(i=>{cnt[i.name]=(cnt[i.name]||0)+1;i.key=i.name+'#'+cnt[i.name]});
+  if(rs&&oldI.length===items.length&&items.every((n,i)=>n.key===oldI[i].key)){
+    // keep the existing boxes and rows; only refresh where each value sits in the text
+    items.forEach((n,i)=>{const o=oldI[i];o.xa=n.xa;o.ya=n.ya;o.ins=n.ins;
+      if(rs===2){o.x=n.x;o.y=n.y;o.sx.value=o.nx.value=o.x;o.sy.value=o.ny.value=o.y;place(o)}
+      o.ox=o.x;o.oy=o.y});
+    oldB.wa=board.wa;oldB.ha=board.ha;
+    if(rs===2){oldB.w=board.w;oldB.h=board.h;$('#bw').value=oldB.w;$('#bh').value=oldB.h}
+    oldB.ow=oldB.w;oldB.oh=oldB.h;
+    items=oldI;board=oldB;if(rs===2)drawBoard();return;
+  }
   $('#bw').value=board.w;$('#bh').value=board.h;
   $('#info').textContent=' '+items.length+' items found';
-  render(); out();
+  render(); setSel([]); out();
 }
 
 // ---------- rendering ----------
@@ -118,7 +142,7 @@ function bounds(){
 }
 function fit(){
   bounds(); const w=B.x1-B.x0,h=B.y1-B.y0;
-  svg.setAttribute('viewBox',`${B.x0} ${-B.y1} ${w} ${h}`);
+  V={x:B.x0,y:-B.y1,w,h};FW=w;applyV();
   fs=Math.max(w,h)/90;
   items.forEach(it=>{
     it.sx.min=it.sy.min=0;
@@ -157,10 +181,10 @@ function render(){
   });
   items.forEach((it,i)=>{
     const row=document.createElement('div');row.className='row';
-    const nm=document.createElement('span');nm.textContent=it.name;nm.title=it.tag;nm.onclick=()=>select(i);
+    const nm=document.createElement('span');nm.textContent=it.name;nm.title=it.tag;nm.onclick=e=>rowSel(i,e);
     const mk=(k)=>{const s=document.createElement('input');s.type='range';s.step=.1;const n=document.createElement('input');n.type='number';n.step=.1;
-      s.oninput=()=>{n.value=s.value;setPos(i,k==='x'?+s.value:it.x,k==='y'?+s.value:it.y);select(i,true)};
-      n.oninput=()=>{if(n.value==='')return;s.value=n.value;setPos(i,k==='x'?+n.value:it.x,k==='y'?+n.value:it.y);select(i,true)};
+      s.oninput=()=>{n.value=s.value;setPos(i,k==='x'?+s.value:it.x,k==='y'?+s.value:it.y);if(!S.has(i))setSel([i])};
+      n.oninput=()=>{if(n.value==='')return;s.value=n.value;setPos(i,k==='x'?+n.value:it.x,k==='y'?+n.value:it.y);if(!S.has(i))setSel([i])};
       return [s,n]};
     const [sx,nx]=mk('x'),[sy,ny]=mk('y');
     Object.assign(it,{row,sx,nx,sy,ny});
@@ -170,11 +194,19 @@ function render(){
   items.forEach(it=>{it.sx.value=it.nx.value=it.x;it.sy.value=it.ny.value=it.y});
   setLabels();
 }
-function setLabels(){const on=$('#lbl').checked;items.forEach((it,i)=>it.t.style.display=on||i===sel?'':'none')}
-function select(i,keep){
-  sel=i;items.forEach((it,k)=>{it.row.classList.toggle('sel',k===i);it.r.setAttribute('stroke-width',k===i?3:1)});
-  if(!keep)items[i].row.scrollIntoView({block:'nearest'});
+function setLabels(){const on=$('#lbl').checked;items.forEach((it,i)=>it.t.style.display=on||S.has(i)?'':'none')}
+function setSel(ids,scroll){
+  S=new Set(ids);
+  items.forEach((it,k)=>{const on=S.has(k);it.row.classList.toggle('sel',on);it.r.setAttribute('stroke-width',on?3:1)});
+  if(scroll&&S.size===1){ // scroll only the list, never the page
+    const r=items[[...S][0]].row;
+    if(r.offsetTop<list.scrollTop||r.offsetTop+r.offsetHeight>list.scrollTop+list.clientHeight)list.scrollTop=r.offsetTop-list.clientHeight/2;
+  }
+  $('#cnt').textContent=S.size+' selected';
   setLabels();
+}
+function rowSel(i,e){
+  if(e.shiftKey||e.ctrlKey||e.metaKey)setSel(S.has(i)?[...S].filter(k=>k!==i):[...S,i]);else setSel([i]);
 }
 function setPos(i,x,y){
   const it=items[i];it.x=r2(x);it.y=r2(y);
@@ -188,21 +220,91 @@ function world(e){
   const q=p.matrixTransform(svg.getScreenCTM().inverse());return{x:q.x,y:-q.y};
 }
 function drag(e,i){
-  e.preventDefault();select(i);
-  const it=items[i],p=world(e),dx=p.x-it.x,dy=p.y-it.y;
-  it.r.setPointerCapture(e.pointerId);
+  e.preventDefault();e.stopPropagation();
+  if(e.shiftKey||e.ctrlKey||e.metaKey){
+    if(S.has(i)){setSel([...S].filter(k=>k!==i));return}
+    setSel([...S,i]);
+  }else if(!S.has(i))setSel([i],true);
+  const ids=[...S],p=world(e),st=ids.map(k=>[items[k].x,items[k].y]),mi=ids.indexOf(i),tg=e.currentTarget;
+  tg.setPointerCapture(e.pointerId);
   const mv=ev=>{
     const q=world(ev),sn=parseFloat($('#snap').value)||0;
-    let x=q.x-dx,y=q.y-dy;
-    if(sn){x=Math.round(x/sn)*sn;y=Math.round(y/sn)*sn}
-    setPos(i,x,y);
+    let dx=q.x-p.x,dy=q.y-p.y;
+    if(sn){dx=Math.round((st[mi][0]+dx)/sn)*sn-st[mi][0];dy=Math.round((st[mi][1]+dy)/sn)*sn-st[mi][1]}
+    ids.forEach((k,n)=>setPos(k,st[n][0]+dx,st[n][1]+dy));
   };
-  const up=()=>{it.r.removeEventListener('pointermove',mv);it.r.removeEventListener('pointerup',up)};
-  it.r.addEventListener('pointermove',mv);it.r.addEventListener('pointerup',up);
+  const up=()=>{tg.removeEventListener('pointermove',mv);tg.removeEventListener('pointerup',up)};
+  tg.addEventListener('pointermove',mv);tg.addEventListener('pointerup',up);
 }
 
+// box select: drag on empty space
+svg.addEventListener('pointerdown',e=>{
+  if(e.target!==svg&&e.target!==svg.bd)return;
+  e.preventDefault();
+  const add=e.shiftKey||e.ctrlKey||e.metaKey,p=world(e),base=add?[...S]:[];
+  if(!add)setSel([]);
+  const m=el('rect',{fill:'rgba(128,128,255,.15)',stroke:'currentColor','stroke-dasharray':'4 2','vector-effect':'non-scaling-stroke','pointer-events':'none'});
+  svg.append(m);svg.setPointerCapture(e.pointerId);
+  const mv=ev=>{
+    const q=world(ev),x0=Math.min(p.x,q.x),x1=Math.max(p.x,q.x),y0=Math.min(p.y,q.y),y1=Math.max(p.y,q.y);
+    m.setAttribute('x',x0);m.setAttribute('y',-y1);m.setAttribute('width',x1-x0);m.setAttribute('height',y1-y0);
+    const hit=items.map((it,k)=>k).filter(k=>{const it=items[k];return it.x>=x0&&it.x<=x1&&it.y>=y0&&it.y<=y1});
+    setSel([...new Set([...base,...hit])]);
+  };
+  const up=()=>{m.remove();svg.removeEventListener('pointermove',mv);svg.removeEventListener('pointerup',up)};
+  svg.addEventListener('pointermove',mv);svg.addEventListener('pointerup',up);
+});
+
+// ---------- alignment ----------
+function gridSort(){
+  const L=(S.size?[...S].map(k=>items[k]):items.slice());
+  if(!L.length)return;
+  L.sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true}));
+  const n=L.length,cols=Math.min(n,parseInt($('#gcols').value)||Math.ceil(Math.sqrt(n))),gap=parseFloat($('#ggap').value)||0;
+  const rows=Math.ceil(n/cols),cw=Array(cols).fill(0),rh=Array(rows).fill(0);
+  L.forEach((it,i)=>{const c=i%cols,r=(i/cols)|0;cw[c]=Math.max(cw[c],it.w);rh[r]=Math.max(rh[r],it.h)});
+  const x0=Math.min(...L.map(i=>i.x-i.w/2)),y0=Math.max(...L.map(i=>i.y+i.h/2));
+  const cx=[],ry=[];let ax=x0,ay=y0;
+  cw.forEach((w,c)=>{cx[c]=ax;ax+=w+gap});rh.forEach((h,r)=>{ry[r]=ay;ay-=h+gap});
+  L.forEach((it,i)=>{const c=i%cols,r=(i/cols)|0;setPos(items.indexOf(it),cx[c]+cw[c]/2,ry[r]-rh[r]/2)});
+}
+function align(a){
+  if(a==='grid')return gridSort();
+  if(a==='all')return setSel(items.map((_,k)=>k));
+  if(a==='none')return setSel([]);
+  const L=[...S].map(k=>items[k]);if(!L.length)return;
+  const R=L.length===1?{l:-board.w/2,r:board.w/2,b:-board.h/2,t:board.h/2}:
+    {l:Math.min(...L.map(i=>i.x-i.w/2)),r:Math.max(...L.map(i=>i.x+i.w/2)),b:Math.min(...L.map(i=>i.y-i.h/2)),t:Math.max(...L.map(i=>i.y+i.h/2))};
+  const mv=(it,x,y)=>setPos(items.indexOf(it),x,y);
+  if(a==='l')L.forEach(i=>mv(i,R.l+i.w/2,i.y));
+  if(a==='r')L.forEach(i=>mv(i,R.r-i.w/2,i.y));
+  if(a==='cx')L.forEach(i=>mv(i,(R.l+R.r)/2,i.y));
+  if(a==='t')L.forEach(i=>mv(i,i.x,R.t-i.h/2));
+  if(a==='b')L.forEach(i=>mv(i,i.x,R.b+i.h/2));
+  if(a==='cy')L.forEach(i=>mv(i,i.x,(R.b+R.t)/2));
+  if(a==='dh'&&L.length>2){
+    const gap=(R.r-R.l-L.reduce((s,i)=>s+i.w,0))/(L.length-1);let pos=R.l;
+    L.sort((p,q)=>p.x-q.x).forEach(i=>{mv(i,pos+i.w/2,i.y);pos+=i.w+gap});
+  }
+  if(a==='dv'&&L.length>2){
+    const gap=(R.t-R.b-L.reduce((s,i)=>s+i.h,0))/(L.length-1);let pos=R.t;
+    L.sort((p,q)=>q.y-p.y).forEach(i=>{mv(i,i.x,pos-i.h/2);pos-=i.h+gap});
+  }
+}
+$('#align').addEventListener('click',e=>{const a=e.target.dataset&&e.target.dataset.a;if(a)align(a)});
+addEventListener('keydown',e=>{
+  if(/INPUT|TEXTAREA/.test(document.activeElement.tagName)||!S.size)return;
+  if(e.key==='Escape')return setSel([]);
+  const d={ArrowLeft:[-1,0],ArrowRight:[1,0],ArrowUp:[0,1],ArrowDown:[0,-1]}[e.key];if(!d)return;
+  e.preventDefault();const st=(e.shiftKey?10:1)*(parseFloat($('#snap').value)||.1);
+  S.forEach(k=>setPos(k,items[k].x+d[0]*st,items[k].y+d[1]*st));
+});
+
 // ---------- output ----------
-function out(){
+let ot=0;
+function out(){if(!ot)ot=setTimeout(()=>{ot=0;syncText()},80);save()}
+function syncText(){
+  if(!board)return;
   const ed=[];
   if(board.wa&&board.w!==board.ow)ed.push({s:board.wa.as,e:board.wa.ve,t:`width="${board.w}mm"`});
   if(board.ha&&board.h!==board.oh)ed.push({s:board.ha.as,e:board.ha.ve,t:`height="${board.h}mm"`});
@@ -212,19 +314,97 @@ function out(){
   });
   ed.sort((a,b)=>b.s-a.s);
   let t=src;ed.forEach(d=>{t=t.slice(0,d.s)+d.t+t.slice(d.e)});
-  $('#out').value=t;
+  if(!ed.length)return;
+  const ta=$('#src'),st=ta.scrollTop;
+  ta.value=t;ta.scrollTop=st;
+  RS=true;parse();RS=false;
+  markH();
+  save();
 }
 
 // ---------- events ----------
-$('#src').addEventListener('input',parse);
+$('#src').addEventListener('input',()=>{orig=$('#src').value;parse();markH()});
 $('#fit').onclick=fit;
-$('#lbl').onchange=setLabels;
+$('#lbl').onchange=()=>{setLabels();save()};
+$('#snap').addEventListener('input',()=>save());
 ['bw','bh'].forEach(id=>$('#'+id).addEventListener('input',e=>{
   const v=parseFloat(e.target.value);if(!(v>0))return;
   board[id==='bw'?'w':'h']=v;drawBoard();out();
 }));
-$('#copy').onclick=()=>{const o=$('#out');o.select();try{document.execCommand('copy')}catch(e){}};
+$('#copy').onclick=()=>{const o=$('#src');o.select();try{document.execCommand('copy')}catch(e){}};
+// ---------- zoom / pan ----------
+function applyV(){svg.setAttribute('viewBox',`${V.x} ${V.y} ${V.w} ${V.h}`)}
+function zoomAt(f,px,py){ // px,py in svg user coords (y already flipped)
+  const nw=V.w/f;if(nw<FW/100||nw>FW*10)return;
+  V={x:px-(px-V.x)/f,y:py-(py-V.y)/f,w:nw,h:V.h/f};applyV();
+}
+const zoomMid=f=>zoomAt(f,V.x+V.w/2,V.y+V.h/2);
+$('#zin').onclick=()=>zoomMid(1.4);
+$('#zout').onclick=()=>zoomMid(1/1.4);
+svg.addEventListener('wheel',e=>{e.preventDefault();const p=world(e);zoomAt(e.deltaY<0?1.15:1/1.15,p.x,-p.y)},{passive:false});
+svg.addEventListener('mousedown',e=>{if(e.button===1)e.preventDefault()});
+svg.addEventListener('pointerdown',e=>{ // middle button drag = pan
+  if(e.button!==1)return;
+  e.preventDefault();e.stopPropagation();
+  const V0={...V},cx=e.clientX,cy=e.clientY,k=1/svg.getScreenCTM().a;
+  svg.setPointerCapture(e.pointerId);
+  const mv=ev=>{V={...V0,x:V0.x-(ev.clientX-cx)*k,y:V0.y-(ev.clientY-cy)*k};applyV()};
+  const up=()=>{svg.removeEventListener('pointermove',mv);svg.removeEventListener('pointerup',up)};
+  svg.addEventListener('pointermove',mv);svg.addEventListener('pointerup',up);
+},true);
+
+// ---------- localStorage: code text, slider positions, board size, snap, labels ----------
+// ---------- undo / redo: the text box is the history ----------
+let hist=[],hi=-1,ht=0;
+function pushH(){
+  const v=$('#src').value;if(hist[hi]===v)return;
+  hist=hist.slice(0,hi+1);hist.push(v);
+  if(hist.length>200)hist.shift();
+  hi=hist.length-1;
+}
+function markH(){clearTimeout(ht);ht=setTimeout(()=>{ht=0;pushH()},400)}
+function flush(){
+  if(ot){clearTimeout(ot);ot=0;syncText()}
+  if(ht){clearTimeout(ht);ht=0;pushH()}
+}
+function gotoH(i){
+  if(i<0||i>=hist.length)return;
+  hi=i;$('#src').value=hist[i];
+  RS=2;parse();RS=false;save();
+}
+const undo=()=>{flush();gotoH(hi-1)}, redo=()=>{flush();gotoH(hi+1)};
+$('#undo').onclick=undo;$('#redo').onclick=redo;
+addEventListener('keydown',e=>{
+  if(!(e.ctrlKey||e.metaKey)||e.altKey)return;
+  const k=e.key.toLowerCase();
+  if(k==='z'&&!e.shiftKey){e.preventDefault();undo()}
+  else if(k==='y'||(k==='z'&&e.shiftKey)){e.preventDefault();redo()}
+});
+
+const KEY='pcbviewer1';
+let tm;
+function save(){
+  clearTimeout(tm);
+  tm=setTimeout(()=>{try{localStorage.setItem(KEY,JSON.stringify({
+    src:$('#src').value,orig:orig,snap:$('#snap').value,lbl:$('#lbl').checked,bw:board.w,bh:board.h,
+    pos:Object.fromEntries(items.map(i=>[i.key,[i.x,i.y]]))}))}catch(e){}},150);
+}
+let sv={};try{sv=JSON.parse(localStorage.getItem(KEY))||{}}catch(e){}
+if(sv.src)$('#src').value=sv.src;
+orig=sv.orig||$('#src').value;
+hist=[$('#src').value];hi=0;
+if(sv.snap!=null)$('#snap').value=sv.snap;
+if(sv.lbl!=null)$('#lbl').checked=sv.lbl;
+$('#rst').onclick=()=>{$('#src').value=orig;parse()};
 parse();
+if(sv.src){
+  if(sv.bw>0){board.w=sv.bw;$('#bw').value=sv.bw}
+  if(sv.bh>0){board.h=sv.bh;$('#bh').value=sv.bh}
+  items.forEach((it,i)=>{const p=sv.pos&&sv.pos[it.key];if(p)setPos(i,p[0],p[1])});
+  fit();
+  items.forEach(it=>{it.sx.value=it.x;it.sy.value=it.y});
+  setLabels();out();
+}
 </script>
 </body>
 </html>
