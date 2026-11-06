@@ -1,2 +1,2 @@
 npm install -g surge
-surge --domain tscircuitplace.surge.sh
+surge --domain tscircuitplacer.surge.sh
